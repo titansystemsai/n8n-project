@@ -27,6 +27,8 @@ from typing import Optional
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
+from agents.results import ExportResult
+
 load_dotenv()
 
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
@@ -145,18 +147,15 @@ def export(
     campaign_name: str,
     output_path: str,
     dry_run: bool = False,
-) -> int:
-    """
-    Export approved outreach rows to a CSV file in Instantly format.
-
-    Returns:
-        Number of rows written (0 if nothing to export).
-    """
+    headless: bool = False,
+) -> ExportResult:
+    """Export approved outreach rows to a CSV file in Instantly format."""
+    export_result = ExportResult(campaign_id=campaign_id)
     raw_rows = fetch_unexported_rows(supabase, campaign_id)
 
     if not raw_rows:
         print("  No rows to export (all already exported or none approved).")
-        return 0
+        return export_result
 
     # Flatten and map
     instantly_rows: list[dict] = []
@@ -173,6 +172,8 @@ def export(
             skipped_emails.append(flat.get("business_name", "unknown"))
 
     total = len(instantly_rows)
+    export_result.rows_skipped = len(skipped_emails)
+
     print(f"\n  Instantly CSV Export {'— DRY RUN' if dry_run else ''}")
     print(f"  {'─' * 50}")
     print(f"  Campaign:       {campaign_name}")
@@ -184,16 +185,17 @@ def export(
 
     if dry_run:
         print("  Dry run — no file written, no rows marked.")
-        return 0
+        return export_result
 
     if total == 0:
         print("  Nothing to export.")
-        return 0
+        return export_result
 
-    answer = input("  Proceed? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
-        print("  Aborted.")
-        return 0
+    if not headless:
+        answer = input("  Proceed? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("  Aborted.")
+            return export_result
 
     # Write CSV
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -227,18 +229,24 @@ def export(
             "status": "exported",
         }).in_("id", chunk).execute()
 
+    export_result.rows_exported = total
+    export_result.batch_id = batch_id
+    export_result.file_path = output_path
     print(f"  ✓ Exported {total} rows to {output_path}")
     print(f"  Batch ID: {batch_id}")
     print(f"  Upload this file to Instantly: Leads → Import Leads → CSV")
-    return total
+    return export_result
 
 
 def main() -> None:
+    import sys
     parser = argparse.ArgumentParser(description="Export approved outreach to Instantly CSV")
     parser.add_argument("--campaign", required=True, help="Campaign UUID")
     parser.add_argument("--output", default=None,
                         help="Output CSV path (default: exports/<campaign-name>-<date>.csv)")
     parser.add_argument("--dry-run", action="store_true", default=False)
+    parser.add_argument("--headless", action="store_true", default=False,
+                        help="Skip confirmation prompt (for scheduled/routine runs)")
     args = parser.parse_args()
 
     supabase: Client = create_client(
@@ -256,14 +264,20 @@ def main() -> None:
     )
     if not campaign_result.data:
         print(f"Campaign not found: {args.campaign}")
-        return
+        sys.exit(1)
 
     campaign_name = campaign_result.data["name"]
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     safe_name = re.sub(r"[^a-zA-Z0-9\-_]", "_", campaign_name)
     output_path = args.output or f"exports/{safe_name}_{date_str}.csv"
 
-    export(supabase, args.campaign, campaign_name, output_path, args.dry_run)
+    try:
+        export(supabase, args.campaign, campaign_name, output_path,
+               args.dry_run, args.headless)
+    except Exception as e:
+        print(f"Export failed: {e}")
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

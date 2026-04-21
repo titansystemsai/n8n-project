@@ -53,6 +53,10 @@ class ServiceDownError(APIError):
 class TimeoutError(APIError):
     code = "TIMEOUT"
 
+class BillingError(APIError):
+    """402 or account-suspended response — subscription lapsed or payment failed."""
+    code = "BILLING_ERROR"
+
 
 # ---------------------------------------------------------------------------
 # Hunter.io quota — atomic claim via Supabase RPC
@@ -156,6 +160,8 @@ def _check_hunter(api_key: str) -> tuple[bool, str]:
         )
         if resp.status_code == 401:
             return False, "CREDENTIAL_INVALID — update HUNTER_IO_API_KEY in .env"
+        if resp.status_code == 402:
+            return False, "BILLING_ERROR — Hunter.io subscription lapsed or payment failed"
         if resp.status_code == 429:
             return False, "QUOTA_EXHAUSTED — monthly limit reached"
         if not resp.ok:
@@ -169,13 +175,14 @@ def _check_anthropic(api_key: str) -> tuple[bool, str]:
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
-        # Minimal call — list models is the cheapest validation
         client.models.list()
         return True, "valid"
     except Exception as e:
         msg = str(e).lower()
         if "401" in msg or "authentication" in msg:
             return False, "CREDENTIAL_INVALID — update ANTHROPIC_API_KEY in .env"
+        if "402" in msg or "billing" in msg or "payment" in msg or "credit" in msg:
+            return False, "BILLING_ERROR — Anthropic account billing issue; check console.anthropic.com"
         return False, f"unreachable ({e})"
 
 
@@ -191,6 +198,8 @@ def _check_supabase(url: str, service_key: str) -> tuple[bool, str]:
         )
         if resp.status_code in (401, 403):
             return False, "CREDENTIAL_INVALID — update SUPABASE_SERVICE_ROLE_KEY in .env"
+        if resp.status_code == 402:
+            return False, "BILLING_ERROR — Supabase project paused (free tier limit); upgrade at supabase.com"
         return True, "valid"
     except Exception as e:
         return False, f"unreachable ({e})"
@@ -205,6 +214,8 @@ def _check_apify(api_key: str) -> tuple[bool, str]:
         )
         if resp.status_code == 401:
             return False, "CREDENTIAL_INVALID — update APIFY_API_KEY in .env"
+        if resp.status_code == 402:
+            return False, "BILLING_ERROR — Apify subscription lapsed or payment failed; check console.apify.com"
         if not resp.ok:
             return False, f"SERVICE_DOWN ({resp.status_code})"
         return True, "valid"
@@ -223,14 +234,14 @@ def run_preflight(supabase: Client, org_id: str) -> list[dict]:
     """
     checks = []
 
-    # Supabase (blocking — agents cannot run without it)
+    # Supabase (blocking — agents cannot run without it; both auth and billing failures block)
     ok, msg = _check_supabase(
         os.environ.get("SUPABASE_URL", ""),
         os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
     )
     checks.append({"name": "SUPABASE_SERVICE_ROLE_KEY", "ok": ok, "message": msg, "blocking": True})
 
-    # Anthropic (blocking — agents cannot reason without it)
+    # Anthropic (blocking — both invalid key and billing issues block the run)
     ok, msg = _check_anthropic(os.environ.get("ANTHROPIC_API_KEY", ""))
     checks.append({"name": "ANTHROPIC_API_KEY", "ok": ok, "message": msg, "blocking": True})
 

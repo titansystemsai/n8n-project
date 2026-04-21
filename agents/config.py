@@ -76,6 +76,8 @@ class OutreachConfig:
     ])
     anthropic_model: str = "claude-sonnet-4-6"
     instantly_campaign_id: Optional[str] = None   # set when exporting to Instantly
+    include_gmaps_context: bool = True    # reference rating/reviews when available
+    include_linkedin_context: bool = True # reference DM's LinkedIn profile when available
 
 
 @dataclass

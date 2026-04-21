@@ -42,6 +42,7 @@ from dotenv import load_dotenv
 from supabase import Client, create_client
 
 from agents.config import CampaignConfig, load_campaign_config
+from agents.results import EnrichmentRunResult
 from agents.quota import (
     CredentialInvalidError,
     QuotaExhaustedError,
@@ -268,7 +269,8 @@ async def run_batch(
     anthropic_client: anthropic.Anthropic,
     dry_run: bool = False,
     limit: Optional[int] = None,
-) -> None:
+    headless: bool = False,
+) -> EnrichmentRunResult:
     global _anthropic_semaphore, _hunter_quota_exhausted
     _hunter_quota_exhausted = False
     _anthropic_semaphore = asyncio.Semaphore(config.enrichment.max_concurrent_workers)
@@ -317,18 +319,21 @@ async def run_batch(
     print(f"  Hunter quota:   {quota['used']}/{quota['limit']} used this month")
     print()
 
+    result = EnrichmentRunResult(campaign_id=config.campaign_id)
+
     if dry_run:
         print("  Dry run complete. Pass --no-dry-run to execute.")
-        return
+        return result
 
     if total_queued == 0:
         print("  No leads to process.")
-        return
+        return result
 
-    answer = input("  Proceed? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
-        print("  Aborted.")
-        return
+    if not headless:
+        answer = input("  Proceed? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("  Aborted.")
+            return
 
     print(f"\n  Starting enrichment for {total_queued} leads...\n")
 
@@ -363,7 +368,9 @@ async def run_batch(
         await asyncio.gather(*tasks)
         processed += len(leads)
 
+    result.leads_processed = processed
     print(f"\n  Done. Processed {processed} leads.")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -457,10 +464,13 @@ def _alert_slack(message: str, service: str, campaign: str, lead_index: int) -> 
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import sys
     parser = argparse.ArgumentParser(description="Enrichment Agent")
     parser.add_argument("--campaign", required=True, help="Campaign UUID")
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="Preview run without processing leads")
+    parser.add_argument("--headless", action="store_true", default=False,
+                        help="Skip confirmation prompts (for scheduled/routine runs)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Maximum number of leads to process")
     args = parser.parse_args()
@@ -475,7 +485,7 @@ def main() -> None:
     checks = run_preflight(supabase, _get_org_id(supabase, args.campaign))
     if has_blocking_failures(checks):
         print("\n  ✗ Blocking credential failures found. Fix before proceeding.\n")
-        return
+        sys.exit(1)
 
     # Check Apify credits before starting (non-blocking: warning only)
     try:
@@ -484,7 +494,13 @@ def main() -> None:
         print(f"  ⚠ {e}\n  Facebook scrape may be limited.\n")
 
     config = load_campaign_config(supabase, args.campaign)
-    asyncio.run(run_batch(supabase, config, anthropic_client, args.dry_run, args.limit))
+    try:
+        asyncio.run(run_batch(supabase, config, anthropic_client,
+                              args.dry_run, args.limit, args.headless))
+    except Exception as e:
+        log.error("Enrichment run failed: %s", e)
+        sys.exit(1)
+    sys.exit(0)
 
 
 def _get_org_id(supabase: Client, campaign_id: str) -> str:

@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from supabase import Client, create_client
 
 from agents.config import CampaignConfig, OutreachConfig, load_campaign_config
+from agents.results import EmailRunResult
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -79,6 +80,9 @@ async def draft_email(
     website = lead.get("website", "")
     research_notes = dm.get("research_notes", "")
     icp_score = dm.get("icp_score", 0)
+    linkedin_url = dm.get("linkedin_url", "")
+    gmaps_rating = lead.get("gmaps_rating")
+    gmaps_reviews = lead.get("gmaps_reviews")
 
     system = SYSTEM_PROMPT.format(
         sender_name=config.sender_name,
@@ -90,6 +94,19 @@ async def draft_email(
         avoid_phrases="\n".join(f"- {p}" for p in config.avoid_phrases),
     )
 
+    # Build optional context lines
+    extra_context_lines: list[str] = []
+    if config.include_gmaps_context and gmaps_rating is not None:
+        reviews_note = f" ({gmaps_reviews} reviews)" if gmaps_reviews else ""
+        extra_context_lines.append(f"Google Maps rating: {gmaps_rating}★{reviews_note}")
+    if config.include_linkedin_context and linkedin_url:
+        extra_context_lines.append(f"LinkedIn: {linkedin_url}")
+
+    extra_context = (
+        "\nAdditional context:\n" + "\n".join(extra_context_lines)
+        if extra_context_lines else ""
+    )
+
     user_message = (
         f"Write an email to:\n"
         f"Name: {first_name} ({name})\n"
@@ -97,7 +114,8 @@ async def draft_email(
         f"Business: {business}\n"
         f"Category: {category}\n"
         f"Website: {website or 'none'}\n"
-        f"ICP Score: {icp_score}/100\n\n"
+        f"ICP Score: {icp_score}/100"
+        f"{extra_context}\n\n"
         f"Research notes (use this to personalise):\n{research_notes or 'No notes available — write based on business name and category.'}"
     )
 
@@ -151,11 +169,12 @@ async def run_email_batch(
     anthropic_client: anthropic.Anthropic,
     dry_run: bool = False,
     limit: Optional[int] = None,
-) -> None:
+    headless: bool = False,
+) -> EmailRunResult:
     # Fetch approved decision makers for this campaign
     query = (
         supabase.table("decision_makers")
-        .select("*, leads!inner(id, business_name, category, website, location, campaign_id)")
+        .select("*, leads!inner(id, business_name, category, website, location, campaign_id, gmaps_rating, gmaps_reviews)")
         .eq("status", "approved")
         .gte("icp_score", config.lead_filter.min_icp_score_for_email)
         .eq("leads.campaign_id", config.campaign_id)
@@ -179,18 +198,21 @@ async def run_email_batch(
     print(f"  Est. cost:    ~${est_cost:.2f}")
     print()
 
+    run_result = EmailRunResult(campaign_id=config.campaign_id)
+
     if dry_run:
         print("  Dry run complete. Pass --no-dry-run to execute.")
-        return
+        return run_result
 
     if total == 0:
         print("  No approved decision makers to draft for.")
-        return
+        return run_result
 
-    answer = input("  Proceed? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
-        print("  Aborted.")
-        return
+    if not headless:
+        answer = input("  Proceed? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("  Aborted.")
+            return run_result
 
     print(f"\n  Drafting emails for {total} decision makers...\n")
 
@@ -207,12 +229,14 @@ async def run_email_batch(
         )
         for i, dm in enumerate(dms)
     ]
-    results = await asyncio.gather(*tasks)
+    drafts = await asyncio.gather(*tasks)
 
     # Write drafts to Supabase
     written = 0
-    for dm, draft in zip(dms, results):
+    skipped = 0
+    for dm, draft in zip(dms, drafts):
         if not draft:
+            skipped += 1
             continue
         supabase.table("outreach").upsert({
             "decision_maker_id": dm["id"],
@@ -226,8 +250,11 @@ async def run_email_batch(
         }, on_conflict="decision_maker_id").execute()
         written += 1
 
+    run_result.drafts_written = written
+    run_result.drafts_skipped = skipped
     print(f"\n  Done. {written}/{total} drafts written to outreach table.")
     print("  Review in Supabase — set status = 'approved_for_send' to export.")
+    return run_result
 
 
 def _extract_text(response) -> Optional[str]:
@@ -252,9 +279,12 @@ def _parse_json(text: str) -> Optional[dict]:
 
 
 def main() -> None:
+    import sys
     parser = argparse.ArgumentParser(description="Email Building Agent")
     parser.add_argument("--campaign", required=True, help="Campaign UUID")
     parser.add_argument("--dry-run", action="store_true", default=False)
+    parser.add_argument("--headless", action="store_true", default=False,
+                        help="Skip confirmation prompts (for scheduled/routine runs)")
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
@@ -265,7 +295,13 @@ def main() -> None:
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     config = load_campaign_config(supabase, args.campaign)
 
-    asyncio.run(run_email_batch(supabase, config, anthropic_client, args.dry_run, args.limit))
+    try:
+        asyncio.run(run_email_batch(supabase, config, anthropic_client,
+                                    args.dry_run, args.limit, args.headless))
+    except Exception as e:
+        log.error("Email run failed: %s", e)
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
