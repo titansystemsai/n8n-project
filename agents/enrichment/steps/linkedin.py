@@ -21,13 +21,15 @@ log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are verifying a LinkedIn profile for a specific person.
 
-Fetch the LinkedIn URL provided and read the public profile page. Extract:
-1. Full name (confirm or correct)
+Use the web_search tool to search for the person by name and business. Do NOT attempt to fetch URLs directly — use the search tool only.
+
+Search for their name + business to confirm:
+1. Full name (confirm or correct what you were given)
 2. Current job title at the business in question
 3. Approximate tenure (how long they've been at this business)
 4. Whether they appear to be the owner/founder/director (not just an employee)
 
-Return ONLY valid JSON:
+Return ONLY valid JSON with no preamble or markdown:
 {
   "name": "Confirmed Full Name or null",
   "title": "Current title or null",
@@ -37,7 +39,7 @@ Return ONLY valid JSON:
   "notes": "brief note on what you found"
 }
 
-If the profile is private, returns a 404, or you cannot access it, return:
+If you cannot find any information after searching, return:
 {"error": "PROFILE_UNAVAILABLE", "notes": "reason"}"""
 
 
@@ -66,10 +68,10 @@ def run_linkedin_verify(
     name_context = f"We believe this person is named {candidate_name}." if candidate_name else ""
 
     user_message = (
-        f"Verify this LinkedIn profile for a decision maker at '{business}'.\n"
+        f"Use web_search to verify a decision maker at '{business}'.\n"
         f"{name_context}\n"
-        f"LinkedIn URL: {linkedin_url}\n\n"
-        f"Fetch the profile page and confirm their name, title, and how long they've worked there."
+        f"LinkedIn profile hint: {linkedin_url}\n\n"
+        f"Search for their name and business to confirm their name, title, and tenure."
     )
 
     try:

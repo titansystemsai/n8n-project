@@ -30,6 +30,7 @@ from typing import Optional
 
 import anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 from supabase import Client, create_client
 
 from agents.config import load_campaign_config
@@ -75,6 +76,7 @@ def _write_json_log(path: str, payload: dict) -> None:
 def run_all_active(
     supabase: Client,
     anthropic_client: anthropic.Anthropic,
+    openai_client: OpenAI,
     org_id: Optional[str] = None,
     dry_run: bool = False,
     json_log_path: Optional[str] = None,
@@ -139,7 +141,7 @@ def run_all_active(
         try:
             config = load_campaign_config(supabase, campaign_id)
             result = asyncio.run(
-                run_batch(supabase, config, anthropic_client,
+                run_batch(supabase, config, anthropic_client, openai_client,
                           dry_run=dry_run, headless=True)
             )
             all_results.append(result)
@@ -205,10 +207,12 @@ def main() -> None:
         os.environ["SUPABASE_SERVICE_ROLE_KEY"],
     )
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    openai_client    = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
     exit_code = run_all_active(
         supabase=supabase,
         anthropic_client=anthropic_client,
+        openai_client=openai_client,
         org_id=args.org,
         dry_run=args.dry_run,
         json_log_path=args.json_log,

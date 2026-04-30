@@ -93,7 +93,7 @@ def get_hunter_quota_status(supabase: Client, org_id: str) -> dict:
         .maybe_single()
         .execute()
     )
-    if result.data:
+    if result and result.data:
         return {
             "used": result.data["requests_used"],
             "limit": result.data["requests_limit"] or HUNTER_MONTHLY_LIMIT,
@@ -126,18 +126,21 @@ def check_apify_credits() -> float:
         raise CredentialInvalidError(
             "APIFY_API_KEY is invalid or expired. Update in .env"
         )
-    if not resp.ok:
+    if not resp.is_success:
         raise ServiceDownError(f"Apify account API returned {resp.status_code}")
 
     data = resp.json().get("data", {})
-    # Apify returns credits under different keys depending on plan
-    credits = (
+    # Apify reports credits under different keys depending on plan.
+    # If the field is absent (free plan / new account), credits are unknown — don't fail.
+    credits_raw = (
         data.get("monthlyUsage", {}).get("monthlyUsageCredits", {}).get("remaining")
         or data.get("limits", {}).get("monthlyUsageCreditsUsd")
-        or 0
     )
-    credits = float(credits)
+    if credits_raw is None:
+        # Credits not reported by this plan — assume functional, skip threshold check.
+        return -1.0
 
+    credits = float(credits_raw)
     if credits < APIFY_MIN_CREDITS:
         raise CreditsLowError(
             f"Apify credits critically low: {credits:.2f} remaining. "
@@ -164,7 +167,7 @@ def _check_hunter(api_key: str) -> tuple[bool, str]:
             return False, "BILLING_ERROR — Hunter.io subscription lapsed or payment failed"
         if resp.status_code == 429:
             return False, "QUOTA_EXHAUSTED — monthly limit reached"
-        if not resp.ok:
+        if not resp.is_success:
             return False, f"SERVICE_DOWN ({resp.status_code})"
         return True, "valid"
     except Exception as e:
@@ -205,6 +208,44 @@ def _check_supabase(url: str, service_key: str) -> tuple[bool, str]:
         return False, f"unreachable ({e})"
 
 
+def _check_openai(api_key: str) -> tuple[bool, str]:
+    try:
+        import openai
+        client = openai.OpenAI(api_key=api_key)
+        client.models.list()
+        return True, "valid"
+    except Exception as e:
+        msg = str(e).lower()
+        if "401" in msg or "authentication" in msg or "incorrect api key" in msg:
+            return False, "CREDENTIAL_INVALID — update OPENAI_API_KEY in .env"
+        if "402" in msg or "billing" in msg or "quota" in msg:
+            return False, "BILLING_ERROR — OpenAI account billing issue; check platform.openai.com"
+        return False, f"unreachable ({e})"
+
+
+def _check_brave(api_key: str) -> tuple[bool, str]:
+    try:
+        resp = httpx.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": "test", "count": 1},
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": api_key,
+            },
+            timeout=8,
+        )
+        if resp.status_code == 401:
+            return False, "CREDENTIAL_INVALID — update BRAVE_API_KEY in .env"
+        if resp.status_code == 429:
+            return False, "QUOTA_EXHAUSTED — Brave monthly limit reached; recharge at api.search.brave.com"
+        if not resp.is_success:
+            return False, f"SERVICE_DOWN ({resp.status_code})"
+        return True, "valid"
+    except Exception as e:
+        return False, f"unreachable ({e})"
+
+
 def _check_apify(api_key: str) -> tuple[bool, str]:
     try:
         resp = httpx.get(
@@ -216,64 +257,93 @@ def _check_apify(api_key: str) -> tuple[bool, str]:
             return False, "CREDENTIAL_INVALID — update APIFY_API_KEY in .env"
         if resp.status_code == 402:
             return False, "BILLING_ERROR — Apify subscription lapsed or payment failed; check console.apify.com"
-        if not resp.ok:
+        if not resp.is_success:
             return False, f"SERVICE_DOWN ({resp.status_code})"
         return True, "valid"
     except Exception as e:
         return False, f"unreachable ({e})"
 
 
-def run_preflight(supabase: Client, org_id: str) -> list[dict]:
+def run_preflight(supabase: Client, org_id: str, has_website: bool | None = None) -> list[dict]:
     """
-    Validate all credentials and quota before an enrichment run.
-    Returns a list of check results. Prints a formatted summary.
+    Validate credentials required for the given run context.
+
+    has_website controls which steps will actually execute:
+      None  — all leads (all credentials checked)
+      True  — website-only leads (all credentials checked)
+      False — no-website leads (Hunter.io skipped — it is never called for these leads)
 
     Returns:
-        List of dicts: [{name, ok, message, blocking}]
+        List of dicts: [{name, ok, message, blocking, skipped}]
         'blocking' = True means the run must not proceed.
+        'skipped'  = True means the credential is not used for this run type.
     """
     checks = []
 
-    # Supabase (blocking — agents cannot run without it; both auth and billing failures block)
+    # Supabase (blocking always)
     ok, msg = _check_supabase(
         os.environ.get("SUPABASE_URL", ""),
         os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
     )
-    checks.append({"name": "SUPABASE_SERVICE_ROLE_KEY", "ok": ok, "message": msg, "blocking": True})
+    checks.append({"name": "SUPABASE_SERVICE_ROLE_KEY", "ok": ok, "message": msg, "blocking": True, "skipped": False})
 
-    # Anthropic (blocking — both invalid key and billing issues block the run)
+    # Anthropic (blocking — used for icp_score on all leads; also website_fetch/linkedin_verify with websites)
     ok, msg = _check_anthropic(os.environ.get("ANTHROPIC_API_KEY", ""))
-    checks.append({"name": "ANTHROPIC_API_KEY", "ok": ok, "message": msg, "blocking": True})
+    checks.append({"name": "ANTHROPIC_API_KEY", "ok": ok, "message": msg, "blocking": True, "skipped": False})
 
-    # Hunter.io (non-blocking — fallback steps exist)
-    ok, msg = _check_hunter(os.environ.get("HUNTER_IO_API_KEY", ""))
-    quota = get_hunter_quota_status(supabase, org_id)
-    quota_note = f"  ({quota['used']}/{quota['limit']} used this month)"
-    checks.append({
-        "name": "HUNTER_IO_API_KEY",
-        "ok": ok,
-        "message": msg + (quota_note if ok else ""),
-        "blocking": False,
-    })
+    # OpenAI (blocking — web_search, company_email_search, personal_email_search run for all leads)
+    ok, msg = _check_openai(os.environ.get("OPENAI_API_KEY", ""))
+    checks.append({"name": "OPENAI_API_KEY", "ok": ok, "message": msg, "blocking": True, "skipped": False})
 
-    # Apify (non-blocking — Facebook step skipped if unavailable)
+    # Brave Search (blocking — all three GPT+Brave steps use it)
+    ok, msg = _check_brave(os.environ.get("BRAVE_API_KEY", ""))
+    checks.append({"name": "BRAVE_API_KEY", "ok": ok, "message": msg, "blocking": True, "skipped": False})
+
+    # Hunter.io — only relevant when website steps run (needs a domain to search)
+    if has_website is False:
+        checks.append({
+            "name": "HUNTER_IO_API_KEY",
+            "ok": True,
+            "message": "skipped — not used for no-website leads",
+            "blocking": False,
+            "skipped": True,
+        })
+    else:
+        ok, msg = _check_hunter(os.environ.get("HUNTER_IO_API_KEY", ""))
+        quota = get_hunter_quota_status(supabase, org_id)
+        quota_note = f"  ({quota['used']}/{quota['limit']} used this month)"
+        checks.append({
+            "name": "HUNTER_IO_API_KEY",
+            "ok": ok,
+            "message": msg + (quota_note if ok else ""),
+            "blocking": False,
+            "skipped": False,
+        })
+
+    # Apify (non-blocking — Facebook scrape runs for all leads regardless of website filter)
     ok, msg = _check_apify(os.environ.get("APIFY_API_KEY", ""))
     if ok:
         try:
             credits = check_apify_credits()
-            msg = f"valid  ({credits:.0f} credits remaining)"
+            msg = "valid  (credits not reported — free plan)" if credits < 0 else f"valid  ({credits:.0f} credits remaining)"
         except CreditsLowError as e:
             ok = False
             msg = str(e)
         except Exception:
             msg = "valid (credit check unavailable)"
-    checks.append({"name": "APIFY_API_KEY", "ok": ok, "message": msg, "blocking": False})
+    checks.append({"name": "APIFY_API_KEY", "ok": ok, "message": msg, "blocking": False, "skipped": False})
 
     # Print formatted summary
-    print("\n  Pre-flight credential check:")
+    filter_label = {None: "all leads", True: "website leads only", False: "no-website leads only"}[has_website]
+    print(f"\n  Pre-flight credential check  [{filter_label}]:")
     print("  " + "─" * 50)
     for c in checks:
-        icon = "✓" if c["ok"] else "✗"
+        if c.get("skipped"):
+            icon = "–"
+        elif c["ok"]:
+            icon = "✓"
+        else:
+            icon = "✗"
         pad = 32 - len(c["name"])
         suffix = "  ← BLOCKING" if not c["ok"] and c["blocking"] else ""
         print(f"  {icon} {c['name']}{' ' * pad}{c['message']}{suffix}")
@@ -283,4 +353,4 @@ def run_preflight(supabase: Client, org_id: str) -> list[dict]:
 
 
 def has_blocking_failures(checks: list[dict]) -> bool:
-    return any(not c["ok"] and c["blocking"] for c in checks)
+    return any(not c["ok"] and c["blocking"] and not c.get("skipped") for c in checks)

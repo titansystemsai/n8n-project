@@ -57,12 +57,13 @@ def run_hunter_lookup(
     domain = _extract_domain(website)
 
     try:
+        all_emails: list[dict] = []
         if name and " " in name:
             parts = name.strip().split()
             first, last = parts[0], parts[-1]
             data, confidence = _email_finder(api_key, domain, first, last)
         else:
-            data, confidence = _domain_search(api_key, domain, name)
+            data, confidence, all_emails = _domain_search(api_key, domain, name)
 
         if not data:
             return StepResult(
@@ -72,16 +73,17 @@ def run_hunter_lookup(
                 duration_sec=time.monotonic() - start,
             )
 
+        endpoint = "email_finder" if (name and " " in name) else "domain_search"
         return StepResult(
             step="hunter_io",
             success=True,
             email=data.get("email"),
             email_confidence=_map_confidence(confidence),
             email_source="hunter_io",
-            name=data.get("first_name", "") + " " + data.get("last_name", ""),
+            name=((data.get("first_name") or "") + " " + (data.get("last_name") or "")).strip() or None,
             title=data.get("position"),
-            notes=f"Hunter.io domain search for {domain}. Score: {confidence}",
-            raw=data,
+            notes=f"{endpoint} · {domain} · {len(all_emails) or 1} email(s) · score {confidence}",
+            raw={"primary": data, "all_emails": all_emails, "domain": domain, "endpoint": endpoint},
             duration_sec=time.monotonic() - start,
         )
 
@@ -115,8 +117,8 @@ def _email_finder(api_key: str, domain: str, first: str, last: str) -> tuple[Opt
     return data, data.get("score", 0)
 
 
-def _domain_search(api_key: str, domain: str, name: Optional[str]) -> tuple[Optional[dict], int]:
-    """Hunter Domain Search — returns all emails, we pick the best match."""
+def _domain_search(api_key: str, domain: str, name: Optional[str]) -> tuple[Optional[dict], int, list[dict]]:
+    """Hunter Domain Search — returns best email as primary + all valid emails for writing."""
     resp = httpx.get(
         HUNTER_DOMAIN_SEARCH_URL,
         params={"domain": domain, "api_key": api_key, "limit": 10},
@@ -126,9 +128,8 @@ def _domain_search(api_key: str, domain: str, name: Optional[str]) -> tuple[Opti
     data = resp.json().get("data", {})
     emails = data.get("emails", [])
     if not emails:
-        return None, 0
+        return None, 0, []
 
-    # Prefer owner/director/founder titles, then highest confidence score
     priority_titles = {"owner", "director", "founder", "principal", "partner", "ceo", "managing"}
 
     def score_email(e: dict) -> tuple:
@@ -136,11 +137,12 @@ def _domain_search(api_key: str, domain: str, name: Optional[str]) -> tuple[Opti
         title_match = any(t in title for t in priority_titles)
         return (title_match, e.get("confidence", 0))
 
-    best = max(emails, key=score_email)
-    email = best.get("email")
-    if not email or not EMAIL_REGEX.match(email):
-        return None, 0
-    return best, best.get("confidence", 0)
+    valid = [e for e in emails if EMAIL_REGEX.match(e.get("email", ""))]
+    if not valid:
+        return None, 0, []
+
+    best = max(valid, key=score_email)
+    return best, best.get("confidence", 0), valid
 
 
 def _raise_for_hunter_status(resp: httpx.Response) -> None:

@@ -52,6 +52,29 @@ class EmailRunResult:
 
 
 @dataclass
+class IngestionRunResult:
+    campaign_id: str
+    source: str
+    leads_fetched: int = 0
+    leads_inserted: int = 0
+    leads_skipped: int = 0   # duplicates
+    leads_invalid: int = 0   # missing business_name etc.
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def success(self) -> bool:
+        return len(self.errors) == 0
+
+    @property
+    def exit_code(self) -> int:
+        if self.errors:
+            return 1
+        if self.leads_invalid > 0:
+            return 2
+        return 0
+
+
+@dataclass
 class ExportResult:
     campaign_id: str
     rows_exported: int = 0

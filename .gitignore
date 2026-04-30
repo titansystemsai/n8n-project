@@ -1,30 +1,7 @@
-# Environment & secrets — NEVER commit these
 .env
-.env.local
-.env.*.local
+.env.example
 .mcp.json
-
-# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-.venv/
-venv/
-env/
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-
-# Exports (may contain PII)
-exports/
-*.csv
-
-# n8n
-n8n-data/
-
-# Editor
-.vscode/
-.idea/
-*.swp
-*.swo
+.DS_Store

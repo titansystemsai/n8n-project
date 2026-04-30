@@ -115,7 +115,7 @@ def run_facebook_scrape(lead: dict) -> StepResult:
 
 def _find_facebook_url(business: str, location: str) -> Optional[str]:
     """Brave Search for the Facebook page."""
-    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
+    api_key = os.environ.get("BRAVE_API_KEY", "")
     query = f"{business} {location} site:facebook.com".strip()
 
     try:
@@ -130,15 +130,14 @@ def _find_facebook_url(business: str, location: str) -> Optional[str]:
 
     if resp.status_code == 401:
         raise CredentialInvalidError(
-            "BRAVE_SEARCH_API_KEY is invalid or expired. Update in .env"
+            "BRAVE_API_KEY is invalid or expired. Update in .env"
         )
-    if not resp.ok:
+    if not resp.is_success:
         raise ServiceDownError(f"Brave Search returned {resp.status_code}")
 
     results = resp.json().get("web", {}).get("results", [])
     for r in results:
         url = r.get("url", "")
-        # Accept facebook.com/pages/... or facebook.com/businessname
         if "facebook.com" in url and "/groups/" not in url and "/events/" not in url:
             return url
     return None

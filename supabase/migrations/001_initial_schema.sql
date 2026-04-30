@@ -61,7 +61,8 @@ CREATE TABLE leads (
   retry_count        INT  NOT NULL DEFAULT 0,
   locked_at          TIMESTAMPTZ,
   locked_by          TEXT,             -- agent session UUID
-  lock_expires_at    TIMESTAMPTZ GENERATED ALWAYS AS (locked_at + INTERVAL '15 minutes') STORED,
+  -- lock_expires_at is computed inline as locked_at + INTERVAL '15 minutes'
+  -- (generated columns don't support interval arithmetic in Postgres)
   last_error         TEXT,
   enriched_at        TIMESTAMPTZ,
   ingested_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -75,7 +76,7 @@ CREATE TABLE leads (
 );
 
 CREATE INDEX idx_leads_campaign_status ON leads(campaign_id, enrichment_status);
-CREATE INDEX idx_leads_lock_expires ON leads(lock_expires_at) WHERE enrichment_status = 'in_progress';
+CREATE INDEX idx_leads_stale_locks ON leads(locked_at) WHERE enrichment_status = 'in_progress';
 
 -- ---------------------------------------------------------------------------
 -- 4. DECISION MAKERS (from Enrichment Agent)
@@ -280,7 +281,7 @@ BEGIN
     retry_count       = COALESCE(retry_count, 0) + 1,
     last_error        = 'lock_timeout_requeued'
   WHERE enrichment_status = 'in_progress'
-    AND lock_expires_at < NOW()
+    AND locked_at + INTERVAL '15 minutes' < NOW()
     AND retry_count < 3
     AND (p_campaign_id IS NULL OR campaign_id = p_campaign_id);
   GET DIAGNOSTICS v_requeued = ROW_COUNT;
@@ -291,13 +292,35 @@ BEGIN
     locked_at         = NULL,
     locked_by         = NULL
   WHERE enrichment_status = 'in_progress'
-    AND lock_expires_at < NOW()
+    AND locked_at + INTERVAL '15 minutes' < NOW()
     AND retry_count >= 3
     AND (p_campaign_id IS NULL OR campaign_id = p_campaign_id);
   GET DIAGNOSTICS v_killed = ROW_COUNT;
 
   RAISE NOTICE 'Reaper: % re-queued, % marked dead', v_requeued, v_killed;
   RETURN v_requeued + v_killed;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Mark a lead as failed: increment retry, re-queue if retries left, mark dead if exhausted
+CREATE OR REPLACE FUNCTION increment_lead_retry(p_lead_id UUID, p_error TEXT)
+RETURNS VOID AS $$
+DECLARE
+  v_new_retry INT;
+BEGIN
+  UPDATE leads SET
+    retry_count  = retry_count + 1,
+    last_error   = p_error,
+    locked_at    = NULL,
+    locked_by    = NULL
+  WHERE id = p_lead_id
+  RETURNING retry_count INTO v_new_retry;
+
+  IF v_new_retry >= 3 THEN
+    UPDATE leads SET enrichment_status = 'dead'  WHERE id = p_lead_id;
+  ELSE
+    UPDATE leads SET enrichment_status = 'queued' WHERE id = p_lead_id;
+  END IF;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -354,20 +377,18 @@ $$;
 CREATE OR REPLACE FUNCTION audit_status_change()
 RETURNS TRIGGER AS $$
 BEGIN
-  IF (TG_OP = 'UPDATE') AND (
-    OLD.enrichment_status IS DISTINCT FROM NEW.enrichment_status OR
-    OLD.status IS DISTINCT FROM NEW.status
-  ) THEN
-    INSERT INTO audit_log(org_id, table_name, record_id, action, old_data, new_data, changed_by)
-    VALUES (
-      NEW.org_id,
-      TG_TABLE_NAME,
-      NEW.id,
-      'STATUS_CHANGE',
-      to_jsonb(OLD),
-      to_jsonb(NEW),
-      auth.uid()
-    );
+  IF TG_OP = 'UPDATE' THEN
+    IF TG_TABLE_NAME = 'leads' THEN
+      IF OLD.enrichment_status IS DISTINCT FROM NEW.enrichment_status THEN
+        INSERT INTO audit_log(org_id, table_name, record_id, action, old_data, new_data, changed_by)
+        VALUES (NEW.org_id, TG_TABLE_NAME, NEW.id, 'STATUS_CHANGE', to_jsonb(OLD), to_jsonb(NEW), auth.uid());
+      END IF;
+    ELSIF TG_TABLE_NAME = 'outreach' THEN
+      IF OLD.status IS DISTINCT FROM NEW.status THEN
+        INSERT INTO audit_log(org_id, table_name, record_id, action, old_data, new_data, changed_by)
+        VALUES (NEW.org_id, TG_TABLE_NAME, NEW.id, 'STATUS_CHANGE', to_jsonb(OLD), to_jsonb(NEW), auth.uid());
+      END IF;
+    END IF;
   END IF;
   RETURN NEW;
 END;

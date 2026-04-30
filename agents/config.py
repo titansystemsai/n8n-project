@@ -48,13 +48,14 @@ class EnrichmentConfig:
     """Controls how enrichment_agent.py runs per lead."""
     research_depth: str = "standard"           # quick (2 searches) | standard (4) | deep (8)
     email_sources: List[str] = field(default_factory=lambda: [
-        "hunter_io", "website_scrape", "facebook", "domain_guess"
+        "hunter_io", "website_scrape", "facebook"
     ])
     stop_after_first_email: bool = True         # skip remaining sources once an email is found
     max_cost_per_lead_usd: float = 0.05
-    max_concurrent_workers: int = 3             # simultaneous Anthropic sessions
+    max_concurrent_workers: int = 1             # simultaneous lead sessions
     anthropic_model: str = "claude-sonnet-4-6"
     icp_model: str = "claude-haiku-4-5-20251001"  # cheaper model for classification tasks
+    openai_model: str = "gpt-4.1-mini"          # used for web_search (3× Brave + consensus)
     icp: ICPConfig = field(default_factory=ICPConfig)
 
 
